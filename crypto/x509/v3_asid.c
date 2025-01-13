@@ -1,5 +1,5 @@
 /*
- * Copyright 2006-2021 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 2006-2024 The OpenSSL Project Authors. All Rights Reserved.
  *
  * Licensed under the Apache License 2.0 (the "License").  You may not use
  * this file except in compliance with the License.  You can obtain a copy
@@ -542,6 +542,11 @@ static void *v2i_ASIdentifiers(const struct v3_ext_method *method,
         } else {
             ERR_raise(ERR_LIB_X509V3, X509V3_R_EXTENSION_NAME_ERROR);
             X509V3_conf_add_error_name_value(val);
+            goto err;
+        }
+
+        if (val->value == NULL) {
+            ERR_raise(ERR_LIB_X509V3, X509V3_R_EXTENSION_VALUE_ERROR);
             goto err;
         }
 
