@@ -15,7 +15,8 @@ require Exporter;
 our @ISA = qw(Exporter);
 our @EXPORT_OK = qw(generate_public_macros
                     generate_internal_macros
-                    produce_decoder);
+                    produce_decoder
+                    produce_param_list);
 
 my $case_sensitive = 1;
 
@@ -94,6 +95,7 @@ my %params = (
     'ALG_PARAM_MAC' =>          "mac",          # utf8_string
     'ALG_PARAM_PROPERTIES' =>   "properties",   # utf8_string
     'ALG_PARAM_FIPS_APPROVED_INDICATOR' => 'fips-indicator',   # int, -1, 0 or 1
+    'ALG_PARAM_SECURITY_CATEGORY' => "security-category", # int, 0 .. 5
 
     # For any operation that deals with AlgorithmIdentifier, they should
     # implement both of these.
@@ -290,6 +292,7 @@ my %params = (
     'PKEY_PARAM_BITS' =>                "bits",# integer
     'PKEY_PARAM_MAX_SIZE' =>            "max-size",# integer
     'PKEY_PARAM_SECURITY_BITS' =>       "security-bits",# integer
+    'PKEY_PARAM_SECURITY_CATEGORY' =>   '*ALG_PARAM_SECURITY_CATEGORY',
     'PKEY_PARAM_DIGEST' =>              '*ALG_PARAM_DIGEST',
     'PKEY_PARAM_CIPHER' =>              '*ALG_PARAM_CIPHER', # utf8 string
     'PKEY_PARAM_ENGINE' =>              '*ALG_PARAM_ENGINE', # utf8 string
@@ -676,32 +679,37 @@ sub generate_internal_macros {
 }
 
 sub generate_trie {
+    my @keys = @_;
     my %trie;
     my $nodes = 0;
     my $chars = 0;
 
-    foreach my $name (sort keys %params) {
+    foreach my $name (sort @keys) {
         my $val = $params{$name};
-        if (substr($val, 0, 1) ne '*') {
-            my $cursor = \%trie;
-
-            $chars += length($val);
-            for my $i (0 .. length($val) - 1) {
-                my $c = substr($val, $i, 1);
-
-                if (not $case_sensitive) {
-                    $c = '_' if $c eq '-';
-                    $c = lc $c;
-                }
-
-                if (not defined $$cursor{$c}) {
-                    $cursor->{$c} = {};
-                    $nodes++;
-                }
-                $cursor = $cursor->{$c};
-            }
-            $cursor->{'val'} = $name;
+        die("Unknown parameter name '$name'\n") if !defined $val;
+        while (substr($val, 0, 1) eq '*') {
+            $val = $params{substr($val, 1)};
+            die("Unknown referenced parameter from '$name'\n")
+                if !defined $val;
         }
+        my $cursor = \%trie;
+
+        $chars += length($val);
+        for my $i (0 .. length($val) - 1) {
+            my $c = substr($val, $i, 1);
+
+            if (not $case_sensitive) {
+                $c = '_' if $c eq '-';
+                $c = lc $c;
+            }
+
+            if (not defined $$cursor{$c}) {
+                $cursor->{$c} = {};
+                $nodes++;
+            }
+            $cursor = $cursor->{$c};
+        }
+        $cursor->{'val'} = $name;
     }
     #print "\n\n/* $nodes nodes for $chars letters*/\n\n";
     return %trie;
@@ -714,8 +722,6 @@ sub generate_code_from_trie {
     my $indent0 = $idt x ($n + 1);
     my $indent1 = $indent0 . $idt;
     my $strcmp = $case_sensitive ? 'strcmp' : 'strcasecmp';
-
-    print "int ossl_param_find_pidx(const char *s)\n{\n" if $n == 0;
 
     if ($trieref->{'suffix'}) {
         my $suf = $trieref->{'suffix'};
@@ -750,7 +756,6 @@ sub generate_code_from_trie {
         }
     }
     printf "%s}\n", $indent0;
-    print "    return -1;\n}\n" if $n == 0;
     return "";
 }
 
@@ -781,12 +786,45 @@ sub locate_long_endings {
 }
 
 sub produce_decoder {
-    my %t = generate_trie();
+    my $func_name = shift;
+    my @keys = @_;
+    my %t = generate_trie(@keys);
     my $s;
 
     locate_long_endings(\%t);
 
     open local *STDOUT, '>', \$s;
+    printf "int %s(const char *s)\n{\n", $func_name;
     generate_code_from_trie(0, \%t);
+    print "    return -1;\n}\n";
     return $s;
+}
+
+sub produce_param_list {
+    my $static_array = shift;
+    my $array_name = shift;
+    my $static_func = shift;
+    my $func_name = shift;
+    my @params = @_;
+    my @keys = ();
+    my $s;
+
+    open local *STDOUT, '>', \$s;
+    print $static_array . ' ' if $static_array ne '';
+    printf "const OSSL_PARAM %s[] = {\n", $array_name;
+    for (my $i = 0; $i <= $#params; $i++) {
+        my $pname = $params[$i][0];
+        my $ptype = $params[$i][1];
+
+        print "    OSSL_PARAM_$ptype(OSSL_$pname, NULL";
+        print ", 0" if $ptype eq "octet_string" || $ptype eq "octet_ptr"
+                       || $ptype eq "utf8_string" || $ptype eq "utf8_ptr";
+        printf "),\n";
+
+        push(@keys, $pname);
+    }
+    print "    OSSL_PARAM_END\n};\n\n";
+
+    print $static_func . ' ' if $static_func ne '';
+    return $s .  produce_decoder($func_name, @keys);
 }

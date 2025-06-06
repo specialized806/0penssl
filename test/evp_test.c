@@ -48,6 +48,7 @@ typedef struct evp_test_st {
     char *reason;                 /* Expected error reason string */
     void *data;                   /* test specific data */
     int expect_unapproved;
+    int security_category;        /* NIST's security category */
 } EVP_TEST;
 
 /* Test method structure */
@@ -196,6 +197,30 @@ static int rand_check_fips_approved(EVP_RAND_CTX *ctx, EVP_TEST *t)
     if (!EVP_RAND_CTX_get_params(ctx, params))
         return 0;
     return check_fips_approved(t, approved);
+}
+
+static int check_security_category(EVP_TEST *t, void *alg_obj,
+                                   int (*get_param)(void *, OSSL_PARAM *)) {
+    OSSL_PARAM p[2];
+    int security_category = -1;
+
+    if (t->security_category < 0)
+        return 1;
+    p[0] = OSSL_PARAM_construct_int(OSSL_ALG_PARAM_SECURITY_CATEGORY,
+                                    &security_category);
+    p[1] = OSSL_PARAM_construct_end();
+    if (!TEST_int_gt(get_param(alg_obj, p), 0)
+            || !TEST_true(OSSL_PARAM_modified(p))
+            || !TEST_int_eq(security_category, t->security_category)) {
+        t->err = "INCORRECT_SECURITY_CATEGORY";
+        return 0;
+    }
+    return 1;
+}
+
+static int pkey_check_security_category(EVP_TEST *t, EVP_PKEY *pkey) {
+    return check_security_category(t, pkey,
+                                   (int (*)(void *, OSSL_PARAM *))EVP_PKEY_get_params);
 }
 
 static int ctrladd(STACK_OF(OPENSSL_STRING) *controls, const char *value)
@@ -677,8 +702,10 @@ static int digest_test_init(EVP_TEST *t, const char *alg)
     if ((digest = fetched_digest = EVP_MD_fetch(libctx, alg, propquery)) == NULL
         && (digest = EVP_get_digestbyname(alg)) == NULL)
         return 0;
-    if (!TEST_ptr(mdat = OPENSSL_zalloc(sizeof(*mdat))))
+    if (!TEST_ptr(mdat = OPENSSL_zalloc(sizeof(*mdat)))) {
+        EVP_MD_free(fetched_digest);
         return 0;
+    }
     t->data = mdat;
     mdat->digest = digest;
     mdat->fetched_digest = fetched_digest;
@@ -1510,9 +1537,8 @@ static int cipher_test_enc(EVP_TEST *t, int enc, size_t out_misalign,
         /* Some (e.g., GCM) tests use IVs longer than EVP_MAX_IV_LENGTH. */
         unsigned char iv[128];
         if (!TEST_true(EVP_CIPHER_CTX_get_updated_iv(ctx, iv, sizeof(iv)))
-            || ((EVP_CIPHER_get_flags(expected->cipher) & EVP_CIPH_CUSTOM_IV) == 0
-                && !TEST_mem_eq(expected->next_iv, expected->iv_len, iv,
-                                expected->iv_len))) {
+            || !TEST_mem_eq(expected->next_iv, expected->iv_len, iv,
+                            expected->iv_len)) {
             t->err = "INVALID_NEXT_IV";
             goto err;
         } else {
@@ -2461,6 +2487,9 @@ static int kem_test_run(EVP_TEST *t)
         goto err;
     }
 
+    if (!pkey_check_security_category(t, pkey))
+        goto err;
+
     if (!TEST_ptr(kdata->ctx = EVP_PKEY_CTX_new_from_pkey(libctx, pkey, propquery)))
         goto err;
 
@@ -2762,6 +2791,9 @@ static int pkey_test_run(EVP_TEST *t)
     if (!pkey_test_run_init(t))
         goto err;
 
+   if (!pkey_check_security_category(t, EVP_PKEY_CTX_get0_pkey(expected->ctx)))
+        goto err;
+
     /* Make a copy of the EVP_PKEY context, for repeat use further down */
     if (!TEST_ptr(copy = EVP_PKEY_CTX_dup(expected->ctx))) {
         t->err = "INTERNAL_ERROR";
@@ -2890,6 +2922,9 @@ static int pkey_fromdata_test_run(EVP_TEST *t)
         t->err = "KEY_FROMDATA_ERROR";
         goto err;
     }
+    if (!pkey_check_security_category(t, key))
+        goto err;
+
 err:
     ctrl2params_free(params, params_n, params_n_allocstart);
     EVP_PKEY_free(key);
@@ -2999,6 +3034,8 @@ static int verify_test_run(EVP_TEST *t)
 
     if (!pkey_test_run_init(t))
         goto err;
+    if (!pkey_check_security_category(t, EVP_PKEY_CTX_get0_pkey(kdata->ctx)))
+        goto err;
     if (EVP_PKEY_verify(kdata->ctx, kdata->output, kdata->output_len,
                         kdata->input, kdata->input_len) <= 0) {
         t->err = "VERIFY_ERROR";
@@ -3099,6 +3136,8 @@ static int pderive_test_run(EVP_TEST *t)
         goto err;
 
     t->err = NULL;
+    if (!pkey_check_security_category(t, EVP_PKEY_CTX_get0_pkey(expected->ctx)))
+        goto err;
     if (EVP_PKEY_derive_set_peer_ex(expected->ctx, expected->peer,
                                     expected->validate) <= 0) {
         t->err = "DERIVE_SET_PEER_ERROR";
@@ -4492,6 +4531,9 @@ static int keygen_test_run(EVP_TEST *t)
         goto err;
     }
 
+    if (!pkey_check_security_category(t, pkey))
+        goto err;
+
     if (!evp_pkey_is_provided(pkey)) {
         TEST_info("Warning: legacy key generated %s", keygen->keyname);
         goto err;
@@ -4744,6 +4786,9 @@ static int digestsign_test_run(EVP_TEST *t)
     if (!check_deterministic_noncetype(t, expected))
         goto err;
 
+    if (!pkey_check_security_category(t, expected->key))
+        goto err;
+
     for (i = 0; i < sk_OPENSSL_STRING_num(expected->controls); i++) {
         char *value = sk_OPENSSL_STRING_value(expected->controls, i);
         if (!pkey_test_ctrl(t, expected->pctx, value) || t->err != NULL)
@@ -4963,6 +5008,7 @@ static void clear_test(EVP_TEST *t)
     t->skip = 0;
     t->meth = NULL;
     t->expect_unapproved = 0;
+    t->security_category = -1;
 
 #if !defined(OPENSSL_NO_DEFAULT_THREAD_POOL)
     OSSL_set_max_threads(libctx, 0);
@@ -5376,6 +5422,17 @@ start:
                           t->s.test_file, t->s.start);
                 t->skip = 1;
             }
+        } else if (strcmp(pp->key, "Security-Category") == 0) {
+            if (t->security_category >= 0) {
+                TEST_info("Line %d: multiple security category lines", t->s.curr);
+                return 0;
+            }
+            t->security_category = atoi(pp->value);
+            if (t->security_category < 0 || t->security_category > 5) {
+                TEST_info("Line %d: invalid security category, should be 0..5",
+                          t->s.curr);
+                return 0;
+            }
         } else {
             /* Must be test specific line: try to parse it */
             int rv = t->meth->parse(t, pp->key, pp->value);
@@ -5426,7 +5483,9 @@ static int run_file_tests(int i)
     clear_test(t);
 
     free_key_list(public_keys);
+    public_keys = NULL;
     free_key_list(private_keys);
+    private_keys = NULL;
     BIO_free(t->s.key);
     c = t->s.errors;
     OPENSSL_free(t);
